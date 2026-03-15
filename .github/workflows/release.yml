@@ -1,0 +1,112 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build binaries
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${DATE}"
+
+          platforms=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+            "windows/arm64"
+          )
+
+          mkdir -p dist
+          for platform in "${platforms[@]}"; do
+            IFS='/' read -r GOOS GOARCH <<< "$platform"
+            output="vvd-search-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              output="${output}.exe"
+            fi
+            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags "$LDFLAGS" -o "dist/${output}" .
+          done
+
+          cd dist && sha256sum * > checksums.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} dist/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          CHECKSUMS=$(cat dist/checksums.txt)
+          SHA_DARWIN_ARM64=$(echo "$CHECKSUMS" | grep darwin-arm64 | awk '{print $1}')
+          SHA_DARWIN_AMD64=$(echo "$CHECKSUMS" | grep darwin-amd64 | awk '{print $1}')
+          SHA_LINUX_ARM64=$(echo "$CHECKSUMS" | grep linux-arm64 | awk '{print $1}')
+          SHA_LINUX_AMD64=$(echo "$CHECKSUMS" | grep linux-amd64 | awk '{print $1}')
+
+          git clone https://x-access-token:${GH_TOKEN}@github.com/Vulnetix/homebrew-tap.git tap
+          cd tap
+
+          cat > Formula/vvd-search.rb << FORMULA
+          class VvdSearch < Formula
+            desc "Interactive TUI for exploring the Vulnetix Vulnerability Database"
+            homepage "https://github.com/Vulnetix/vvd-search"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/Vulnetix/vvd-search/releases/download/v#{version}/vvd-search-darwin-arm64"
+                sha256 "${SHA_DARWIN_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/Vulnetix/vvd-search/releases/download/v#{version}/vvd-search-darwin-amd64"
+                sha256 "${SHA_DARWIN_AMD64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/Vulnetix/vvd-search/releases/download/v#{version}/vvd-search-linux-arm64"
+                sha256 "${SHA_LINUX_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/Vulnetix/vvd-search/releases/download/v#{version}/vvd-search-linux-amd64"
+                sha256 "${SHA_LINUX_AMD64}"
+              end
+            end
+
+            def install
+              binary = Dir["vvd-search*"].first
+              bin.install binary => "vvd-search"
+            end
+
+            test do
+              assert_match "vvd-search", shell_output("#{bin}/vvd-search --version 2>&1", 0)
+            end
+          end
+          FORMULA
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/vvd-search.rb
+          git commit -m "vvd-search ${VERSION}"
+          git push
